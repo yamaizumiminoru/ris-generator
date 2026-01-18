@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v1.1.0] - 2026-01-18
+
+### Added
+- **Parallel Processing**: Significant speed improvement by processing multiple PDFs simultaneously (configurable 1-10 threads).
+- **Pause/Resume**: Added ability to pause and resume the generation process.
+- **Sleep Prevention**: Option to prevent Windows PC from sleeping during long batch processes.
+- **UI Improvements**: Added "Parallel Processing" setting and "Resume" button to progress dialog.
+
 ## [v1.0.0] - 2026-01-16
 
 ### Added

@@ -22,11 +22,15 @@ def load_config() -> dict:
             return {}
     return {}
 
-def save_config(api_key: str, save_enabled: bool, model_name: str = "gemini-1.5-flash"):
+def save_config(api_key: str, save_enabled: bool, model_name: str = "gemini-1.5-flash", prevent_sleep: bool = False, max_workers: int = 3):
     path = get_config_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     
-    data = {"model_name": model_name}
+    data = {
+        "model_name": model_name,
+        "prevent_sleep": prevent_sleep,
+        "max_workers": max_workers
+    }
     if save_enabled:
         data["api_key"] = api_key
         data["save_key"] = True

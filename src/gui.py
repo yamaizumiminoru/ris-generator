@@ -3,7 +3,7 @@ import os
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QLabel, QLineEdit, QPushButton, QCheckBox, QComboBox, 
-    QProgressBar, QTextEdit, QFileDialog, QMessageBox, QDialog
+    QProgressBar, QTextEdit, QFileDialog, QMessageBox, QDialog, QSpinBox
 )
 from PySide6.QtCore import Qt, Signal, Slot
 from .config import load_config, save_config
@@ -80,6 +80,7 @@ class ResultDialog(QDialog):
 
 class ProgressDialog(QDialog):
     cancel_requested = Signal()
+    pause_requested = Signal() # New signal
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -98,7 +99,30 @@ class ProgressDialog(QDialog):
         
         self.cancel_btn = QPushButton("Stop / Cancel")
         self.cancel_btn.clicked.connect(self.on_cancel)
-        layout.addWidget(self.cancel_btn)
+        
+        # Pause Button
+        self.pause_btn = QPushButton("Pause")
+        self.pause_btn.clicked.connect(self.on_pause_clicked)
+        
+        btn_layout = QHBoxLayout()
+        btn_layout.addWidget(self.pause_btn)
+        btn_layout.addWidget(self.cancel_btn)
+        layout.addLayout(btn_layout)
+        
+    def on_pause_clicked(self):
+        self.pause_requested.emit()
+
+    def set_paused_state(self, is_paused):
+        if is_paused:
+            self.pause_btn.setText("Resume")
+            current_text = self.status_label.text()
+            if not current_text.startswith("(Paused)"):
+                self.status_label.setText(f"(Paused) {current_text}")
+        else:
+            self.pause_btn.setText("Pause")
+            current_text = self.status_label.text().replace("(Paused) ", "")
+            self.status_label.setText(current_text)
+
         
     def update_progress(self, current, total, filename):
         self.progress_bar.setMaximum(total)
@@ -177,6 +201,21 @@ class MainWindow(QMainWindow):
         self.skip_cb.setChecked(True)
         layout.addWidget(self.skip_cb)
         
+        # Sleep Prevention
+        self.prevent_sleep_cb = QCheckBox("Prevent PC sleep while processing (Windows Only)")
+        self.prevent_sleep_cb.setChecked(self.config.get("prevent_sleep", False))
+        layout.addWidget(self.prevent_sleep_cb)
+
+        # Concurrency
+        concurrency_layout = QHBoxLayout()
+        concurrency_layout.addWidget(QLabel("Parallel Processing (Max threads):"))
+        self.workers_spin = QSpinBox()
+        self.workers_spin.setRange(1, 10)
+        self.workers_spin.setValue(self.config.get("max_workers", 3))
+        concurrency_layout.addWidget(self.workers_spin)
+        concurrency_layout.addStretch()
+        layout.addLayout(concurrency_layout)
+
         layout.addStretch()
         
         # 4. Start Button
@@ -218,11 +257,19 @@ class MainWindow(QMainWindow):
         save_config(
             api_key if self.save_key_cb.isChecked() else "",
             self.save_key_cb.isChecked(),
-            self.model_combo.currentData()
+            self.model_combo.currentData(),
+            self.prevent_sleep_cb.isChecked(),
+            self.workers_spin.value()
         )
             
         # Start Worker & Progress Dialog
-        self.worker = ProcessingWorker(files, api_key, self.model_combo.currentData())
+        self.worker = ProcessingWorker(
+            files, 
+            api_key, 
+            self.model_combo.currentData(),
+            prevent_sleep=self.prevent_sleep_cb.isChecked(),
+            max_workers=self.workers_spin.value()
+        )
         self.worker.set_skip_existing(self.skip_cb.isChecked())
         
         self.progress_dlg = ProgressDialog(self)
@@ -231,9 +278,15 @@ class MainWindow(QMainWindow):
         self.worker.progress_update.connect(self.progress_dlg.update_progress)
         self.worker.finished_processing.connect(self.on_finished)
         self.progress_dlg.cancel_requested.connect(self.worker.requestInterruption)
+        self.progress_dlg.pause_requested.connect(self.toggle_pause)
         
         self.worker.start()
         self.progress_dlg.exec()
+        
+    def toggle_pause(self):
+        if self.worker:
+            new_state = self.worker.toggle_pause()
+            self.progress_dlg.set_paused_state(new_state)
         
     def on_finished(self, summary):
         if self.progress_dlg.isVisible():
