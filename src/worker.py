@@ -7,6 +7,7 @@ import random
 import concurrent.futures
 from PySide6.QtCore import QMutex, QWaitCondition
 import ctypes
+import threading
 
 # Windows Sleep Constants
 ES_CONTINUOUS = 0x80000000
@@ -29,6 +30,7 @@ class ProcessingWorker(QThread):
         self.skip_existing = False
         self._paused = False
         self._mutex = QMutex()
+        self._cancel_event = threading.Event()
 
     def toggle_pause(self):
         self._paused = not self._paused
@@ -36,6 +38,34 @@ class ProcessingWorker(QThread):
 
     def set_skip_existing(self, enabled):
         self.skip_existing = enabled
+
+    def request_cancel(self):
+        """Request cooperative cancellation from the GUI.
+
+        ThreadPool jobs cannot be force-killed safely.  This event is visible
+        to both the QThread coordinator and executor worker threads.
+        """
+        self._cancel_event.set()
+        self.requestInterruption()
+
+    def _cancel_requested(self):
+        return self._cancel_event.is_set() or self.isInterruptionRequested()
+
+    def _wait_or_cancel(self, seconds):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self._cancel_requested():
+                return False
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        return not self._cancel_requested()
+
+    @staticmethod
+    def _cancelled_result(filename):
+        return {"status": "cancelled", "filename": filename}
+
+    def _emit_finished(self, summary):
+        # Kept as a seam for lifecycle regression tests.
+        self.finished_processing.emit(summary)
 
     def run(self):
         summary = {
@@ -45,11 +75,10 @@ class ProcessingWorker(QThread):
             "filename_only_success": 0,
             "skipped": 0,
             "failed": 0,
-            "failed_files": [], 
+            "failed_files": [],
             "cancelled": False
         }
 
-        # Sleep Prevention Start
         if self.prevent_sleep:
             try:
                 ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
@@ -57,55 +86,80 @@ class ProcessingWorker(QThread):
             except Exception as e:
                 print(f"Failed to set execution state: {e}")
 
-        # Executor
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
         futures = set()
-        
+
         try:
             for i, pdf_path in enumerate(self.pdf_files):
-                # Pause Check
-                while self._paused:
-                    if self.isInterruptionRequested():
-                        summary["cancelled"] = True
-                        break
-                    self.msleep(100) 
-                
-                # Check cancellation in outer loop
-                if self.isInterruptionRequested() or summary.get("cancelled"):
+                while self._paused and not self._cancel_requested():
+                    self.msleep(100)
+
+                if self._cancel_requested():
                     summary["cancelled"] = True
                     break
-                
-                # Rate Limiting / Queue Control
-                # While we have max_workers active, wait for one to finish
+
+                # Do not queue more than max_workers.  The timeout lets a
+                # cancellation request stop further submissions promptly.
                 while len(futures) >= self.max_workers:
-                     done, futures = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
-                     self._process_futures_results(done, summary)
-                     if self.isInterruptionRequested(): break # Exit wait loop if cancelled
-
-                if summary.get("cancelled") or self.isInterruptionRequested():
-                    break
-
-                # Submit task
-                future = executor.submit(self._process_single_file, pdf_path, i, summary["total"])
-                futures.add(future)
-            
-            # Wait for remaining
-            if not summary.get("cancelled"):
-                while futures:
-                    if self.isInterruptionRequested():
+                    done, pending = concurrent.futures.wait(
+                        futures,
+                        timeout=0.2,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    if done:
+                        self._process_futures_results(done, summary)
+                        futures = pending
+                    if self._cancel_requested():
                         summary["cancelled"] = True
                         break
-                    done, futures = concurrent.futures.wait(futures, timeout=0.2, return_when=concurrent.futures.FIRST_COMPLETED)
-                    self._process_futures_results(done, summary)
-                    
-            # If cancelled, we should try to cancel remaining futures?
-            if summary.get("cancelled"):
-                 for f in futures: f.cancel()
+
+                if summary["cancelled"] or self._cancel_requested():
+                    summary["cancelled"] = True
+                    break
+
+                futures.add(
+                    executor.submit(
+                        self._process_single_file,
+                        pdf_path,
+                        i,
+                        summary["total"],
+                    )
+                )
+
+            if not summary["cancelled"]:
+                while futures:
+                    done, pending = concurrent.futures.wait(
+                        futures,
+                        timeout=0.2,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    if done:
+                        self._process_futures_results(done, summary)
+                        futures = pending
+                    if self._cancel_requested():
+                        summary["cancelled"] = True
+                        break
+
+            if summary["cancelled"]:
+                # Cancels jobs that have not started.  Running jobs cooperate
+                # at safe checkpoints and are awaited below.
+                for future in futures:
+                    future.cancel()
 
         finally:
-            executor.shutdown(wait=False)
-            
-            # Sleep Prevention Release
+            if self._cancel_requested():
+                summary["cancelled"] = True
+
+            # Crucial lifecycle guarantee: finished_processing must not fire
+            # while executor jobs can still write .ris files.
+            executor.shutdown(wait=True, cancel_futures=True)
+
+            # Account for any running jobs that completed while shutdown()
+            # waited.  Cancelled futures have no result to process.
+            remaining_done = {f for f in futures if f.done() and not f.cancelled()}
+            if remaining_done:
+                self._process_futures_results(remaining_done, summary)
+
             if self.prevent_sleep:
                 try:
                     ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
@@ -113,7 +167,7 @@ class ProcessingWorker(QThread):
                 except Exception as e:
                     print(f"Failed to release execution state: {e}")
 
-            self.finished_processing.emit(summary)
+            self._emit_finished(summary)
 
     def _process_futures_results(self, done_futures, summary):
         for f in done_futures:
@@ -123,6 +177,9 @@ class ProcessingWorker(QThread):
                 
                 self._mutex.lock()
                 try:
+                    if res['status'] == 'cancelled':
+                        summary['cancelled'] = True
+                        continue
                     if res['status'] == 'skipped':
                         summary['skipped'] += 1
                     elif res['status'] == 'success':
@@ -147,6 +204,8 @@ class ProcessingWorker(QThread):
 
     def _process_single_file(self, pdf_path, idx, total_count):
         basename = os.path.basename(pdf_path)
+        if self._cancel_requested():
+            return self._cancelled_result(basename)
         # Emit 'Started' signal? Signal emitting from thread is safe.
         self.progress_update.emit(idx + 1, total_count, basename) # idx here is start index, might be out of order in UI updates but OK
 
@@ -159,6 +218,8 @@ class ProcessingWorker(QThread):
         try:
             # 1. Extraction
             text = extract_text_from_pdf(pdf_path)
+            if self._cancel_requested():
+                return self._cancelled_result(basename)
             
             use_filename_mode = False
             if not text.strip():
@@ -170,6 +231,8 @@ class ProcessingWorker(QThread):
             max_retries = 2
             
             for attempt in range(max_retries + 1):
+                if self._cancel_requested():
+                    return self._cancelled_result(basename)
                 try:
                     data = generate_ris_data(
                         text_context=text, 
@@ -178,11 +241,17 @@ class ProcessingWorker(QThread):
                         model_name=self.model_name,
                         filename_mode=use_filename_mode
                     )
+                    # In-flight API calls cannot be force-cancelled safely.
+                    # If Stop was requested while waiting, discard the result
+                    # and do not enter the save phase.
+                    if self._cancel_requested():
+                        return self._cancelled_result(basename)
                     
                     if data: break 
                     else:
                         if attempt < max_retries:
-                            time.sleep(2 ** attempt + random.random())
+                            if not self._wait_or_cancel(2 ** attempt + random.random()):
+                                return self._cancelled_result(basename)
                             continue
                         else:
                             raise Exception("AI_NULL")
@@ -201,7 +270,8 @@ class ProcessingWorker(QThread):
                     if is_retryable and attempt < max_retries:
                         sleep_time = (2 ** attempt) + (random.random() * 1.5)
                         print(f"Retry {attempt+1}/{max_retries} for {basename}: {err_str}")
-                        time.sleep(sleep_time)
+                        if not self._wait_or_cancel(sleep_time):
+                            return self._cancelled_result(basename)
                         continue
                     else:
                         if "429" in err_str or "ResourceExhausted" in err_str: raise Exception("RATE_LIMIT")
@@ -232,11 +302,35 @@ class ProcessingWorker(QThread):
                     success_type = "filename_only"
                     if not has_ti: raise Exception("OCR_REQUIRED") 
 
+                if self._cancel_requested():
+                    return self._cancelled_result(basename)
+
                 ris_content = dict_to_ris(data)
                 ris_path = os.path.splitext(pdf_path)[0] + ".ris"
-                
-                with open(ris_path, "w", encoding="utf-8") as f:
-                    f.write(ris_content)
+                tmp_path = ris_path + ".tmp"
+
+                try:
+                    with open(tmp_path, "w", encoding="utf-8") as f:
+                        f.write(ris_content)
+                        f.flush()
+                        os.fsync(f.fileno())
+
+                    if self._cancel_requested():
+                        try:
+                            os.remove(tmp_path)
+                        except FileNotFoundError:
+                            pass
+                        return self._cancelled_result(basename)
+
+                    # Atomic replacement means an existing completed RIS is
+                    # never exposed as a half-written file.
+                    os.replace(tmp_path, ris_path)
+                finally:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
                 
                 return {'status': 'success', 'filename': basename, 'type': success_type}
                     
@@ -245,7 +339,8 @@ class ProcessingWorker(QThread):
 
         except Exception as e:
             msg = str(e)
-            if "OCR_REQUIRED" in msg: code = "OCR_REQUIRED"
+            if isinstance(e, OSError): code = "WRITE_FAILED"
+            elif "OCR_REQUIRED" in msg: code = "OCR_REQUIRED"
             elif "RATE_LIMIT" in msg: code = "RATE_LIMIT"
             elif "TIMEOUT" in msg: code = "TIMEOUT"
             elif "AI_NULL" in msg: code = "AI_NULL"

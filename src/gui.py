@@ -130,8 +130,9 @@ class ProgressDialog(QDialog):
         self.status_label.setText(f"Processing: {filename}")
         
     def on_cancel(self):
-        self.status_label.setText("Stopping (waiting for current file)...")
+        self.status_label.setText("Stopping (waiting for current file/API response)...")
         self.cancel_btn.setEnabled(False)
+        self.pause_btn.setEnabled(False)
         self.cancel_requested.emit()
 
     def closeEvent(self, event):
@@ -262,7 +263,14 @@ class MainWindow(QMainWindow):
             self.workers_spin.value()
         )
             
+        # Do not allow a new run to overlap an old worker that is still
+        # finishing a cancellation.
+        if getattr(self, "worker", None) is not None and self.worker.isRunning():
+            QMessageBox.information(self, "Stopping", "The previous run is still stopping. Please wait for it to finish.")
+            return
+
         # Start Worker & Progress Dialog
+        self.start_btn.setEnabled(False)
         self.worker = ProcessingWorker(
             files, 
             api_key, 
@@ -277,7 +285,7 @@ class MainWindow(QMainWindow):
         # Signals
         self.worker.progress_update.connect(self.progress_dlg.update_progress)
         self.worker.finished_processing.connect(self.on_finished)
-        self.progress_dlg.cancel_requested.connect(self.worker.requestInterruption)
+        self.progress_dlg.cancel_requested.connect(self.worker.request_cancel)
         self.progress_dlg.pause_requested.connect(self.toggle_pause)
         
         self.worker.start()
@@ -294,6 +302,7 @@ class MainWindow(QMainWindow):
             
         self.worker.deleteLater()
         self.worker = None
+        self.start_btn.setEnabled(True)
         
         # Show Result
         dlg = ResultDialog(summary, self)
