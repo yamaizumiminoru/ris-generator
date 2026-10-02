@@ -339,7 +339,8 @@ class ProcessingWorker(QThread):
 
         except Exception as e:
             msg = str(e)
-            if "OCR_REQUIRED" in msg: code = "OCR_REQUIRED"
+            if isinstance(e, OSError): code = "WRITE_FAILED"
+            elif "OCR_REQUIRED" in msg: code = "OCR_REQUIRED"
             elif "RATE_LIMIT" in msg: code = "RATE_LIMIT"
             elif "TIMEOUT" in msg: code = "TIMEOUT"
             elif "AI_NULL" in msg: code = "AI_NULL"
