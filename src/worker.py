@@ -30,6 +30,7 @@ class ProcessingWorker(QThread):
         self.skip_existing = False
         self._paused = False
         self._mutex = QMutex()
+        self.last_summary = None
         self._cancel_event = threading.Event()
 
     def toggle_pause(self):
@@ -176,6 +177,7 @@ class ProcessingWorker(QThread):
                 except Exception as e:
                     print(f"Failed to release execution state: {e}")
 
+            self.last_summary = summary
             self.finished_processing.emit(summary)
 
     def _process_futures_results(self, done_futures, summary):
